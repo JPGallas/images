@@ -1,0 +1,88 @@
+# Zet het Docker-image ghcr.io/jonwiggins/optio-agent-base:latest als gecomprimeerde tar in een GitHub Release,
+# zodat iedereen het via de browser kan downloaden, zonder account en zonder docker pull.
+#
+# Starten: tabblad Actions -> "optio-agent-base als download" -> Run workflow.
+# Elke run vervangt de bestanden in de release `optio-agent-base`; de downloadlink blijft hetzelfde.
+name: optio-agent-base als download
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write # release aanmaken en bestanden uploaden
+
+concurrency:
+  group: optio-agent-base
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/jonwiggins/optio-agent-base:latest
+  TAG: optio-agent-base
+  FILE: optio-agent-base.tar.gz
+  # GitHub weigert releasebestanden van 2 GiB of groter
+  MAX_BYTES: "2147483648"
+
+defaults:
+  run:
+    shell: bash # met -e en pipefail: een fout ergens in een pipe laat de stap falen
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Image ophalen
+        run: |
+          docker pull "$IMAGE"
+          echo "DIGEST=$(docker inspect --format '{{index .RepoDigests 0}}' "$IMAGE")" >> "$GITHUB_ENV"
+          echo "CREATED=$(docker inspect --format '{{.Created}}' "$IMAGE")" >> "$GITHUB_ENV"
+
+      - name: Opslaan als gecomprimeerde tar
+        run: |
+          docker save "$IMAGE" | gzip -6 > "$FILE"
+          size=$(stat -c %s "$FILE")
+          echo "SIZE_MB=$(( size / 1024 / 1024 ))" >> "$GITHUB_ENV"
+          if [ "$size" -ge "$MAX_BYTES" ]; then
+            echo "::error::$FILE is $(( size / 1024 / 1024 )) MB; GitHub staat maximaal 2048 MB per bestand toe"
+            exit 1
+          fi
+
+      - name: Checksum en licentie
+        run: |
+          sha256sum "$FILE" > SHA256SUMS
+          curl -fsSL -o LICENSE-optio https://raw.githubusercontent.com/jonwiggins/optio/main/LICENSE
+
+      - name: Releasetekst
+        run: |
+          cat > notes.md <<EOF
+          Het Docker-image \`$IMAGE\` als gecomprimeerde tar, om via de browser te downloaden.
+
+          | | |
+          |---|---|
+          | Image | \`$DIGEST\` |
+          | Image gebouwd | $CREATED |
+          | Tar gemaakt | $(date -u +%Y-%m-%dT%H:%M:%SZ) |
+          | Grootte | $SIZE_MB MB |
+
+          **Gebruiken**
+
+          \`\`\`sh
+          sha256sum -c SHA256SUMS                 # optioneel: controleren of de download heel is
+          docker load -i $FILE      # docker pakt de gzip zelf uit
+          \`\`\`
+
+          Optio is gemaakt door [jonwiggins](https://github.com/jonwiggins/optio) en valt onder de MIT-licentie (zie \`LICENSE-optio\`).
+          EOF
+
+      - name: Uploaden naar de release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            gh release edit "$TAG" --notes-file notes.md
+            gh release upload "$TAG" "$FILE" SHA256SUMS LICENSE-optio --clobber
+          else
+            gh release create "$TAG" "$FILE" SHA256SUMS LICENSE-optio \
+              --title "optio-agent-base (Docker-image als download)" --notes-file notes.md --target "$GITHUB_SHA"
+          fi
